@@ -1,0 +1,39 @@
+@import './fonts.css';
+@import './tailwind.css';
+@import './theme.css';
+
+:root {
+    --zoom-factor: 1;
+}
+
+html {
+    /* 透過調整基礎字體大小，驅動全網頁的 rem 單位隨縮放因子變動 */
+    font-size: calc(16px * var(--zoom-factor));
+}
+
+/* Light Theme Strategy using extreme CSS filters to easily contrast everything without needing to override every utility class */
+.light-theme .filter-theme {
+    filter: invert(1) hue-rotate(180deg) brightness(0.95);
+}
+
+.light-theme .filter-theme img,
+.light-theme .filter-theme video,
+.light-theme .filter-theme [style*="background-image"] {
+    filter: invert(1) hue-rotate(180deg);
+}
+
+/* Global Scrollbar Hiding for Mobile Experience */
+* {
+    scrollbar-width: none !important; /* Firefox */
+    -ms-overflow-style: none !important; /* IE/Edge */
+}
+
+::-webkit-scrollbar {
+    display: none !important; /* Chrome, Safari, Opera */
+    width: 0 !important;
+    height: 0 !important;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+    display: none !important;
+}
