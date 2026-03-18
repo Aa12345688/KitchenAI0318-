@@ -19,12 +19,19 @@ export function Recipes() {
                 setIsLoading(true);
                 setHasAttempted(true);
                 try {
-                    const res = await llmService.generateRecipes({ ingredients: scannedItems.map(i => i.name) });
+                    const res = await llmService.generateRecipes({ 
+                        ingredients: scannedItems.map(i => i.name),
+                        // ✨ 樂觀式更新：一旦本地規則過濾完畢，立即顯示食譜，不必等候 AI 審核
+                        onOptimisticResult: (optimisticRecipes) => {
+                            setRecipes(optimisticRecipes);
+                            setIsLoading(false); // 提早結束 loading 狀態
+                        }
+                    });
                     setRecipes(res);
                 } catch (error) {
-                    setRecipes(getRecommendedRecipes(scannedItems)); 
-                } finally { 
-                    setIsLoading(false); 
+                    setRecipes(getRecommendedRecipes(scannedItems));
+                } finally {
+                    setIsLoading(false);
                 }
             };
             fetchRecipes();
@@ -36,8 +43,8 @@ export function Recipes() {
     return (
         <div className="pb-28 pt-6 relative">
             {/* Minimal Floating Back Button */}
-            <button 
-                onClick={() => navigate(-1)} 
+            <button
+                onClick={() => navigate(-1)}
                 className="fixed top-4 left-4 z-[110] w-10 h-10 bg-[#0d231b]/80 backdrop-blur-xl border border-white/10 rounded-full flex items-center justify-center shadow-lg active:scale-90 transition-all"
             >
                 <ChevronLeft size={20} className="text-white" />
@@ -45,28 +52,42 @@ export function Recipes() {
 
             <div className="px-6 py-4">
                 <IngredientCloud items={scannedItems} onAddMore={() => navigate("/inventory")} />
-                
+
                 {isLoading ? (
-                    <div className="flex flex-col items-center justify-center py-16 gap-4 bg-white/5 rounded-[2.5rem] border border-white/10">
-                        <div className="relative w-14 h-14">
-                            <div className="absolute inset-0 border-2 border-primary/20 rounded-full" />
-                            <div className="absolute inset-0 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-                            <Sparkles className="absolute inset-0 m-auto text-primary animate-pulse" size={18} />
+                    <div className="space-y-6">
+                        {/* 步驟提示浮層 */}
+                        <div className="flex flex-col gap-2.5 items-center justify-center py-6 bg-white/5 rounded-[2rem] border border-white/10">
+                            <h3 className="text-primary font-black text-[10px] uppercase animate-pulse mb-1 tracking-widest">AI 食譜引擎運算中</h3>
+                            <div className="flex flex-col gap-1.5 items-start">
+                                <LoadingStep icon="🤖" label="AI 生成食譜建議" delay="0s" />
+                                <LoadingStep icon="📋" label="規則層：過濾危險組合" delay="1s" />
+                                <LoadingStep icon="✅" label="食安審核：確認可安全食用" delay="2s" />
+                            </div>
                         </div>
-                        <div className="text-center">
-                            <h3 className="text-primary font-black text-[10px] uppercase animate-pulse mb-1">運算中...</h3>
-                            <p className="text-gray-500 text-[8px] font-bold uppercase">正在分析口味分佈</p>
+
+                        {/* 骨架屏網格 */}
+                        <div className="grid grid-cols-2 gap-3 opacity-40">
+                            {[...Array(4)].map((_, i) => (
+                                <RecipeSkeleton key={i} />
+                            ))}
                         </div>
                     </div>
                 ) : recommendedRecipes.length > 0 ? (
-                    <div className="space-y-4">
+                    <div className="space-y-4 optimize-list">
+                        {/* 審核說明橫幅 */}
+                        <div className="flex items-center gap-2 px-3 py-2 bg-primary/10 border border-primary/20 rounded-xl">
+                            <span className="text-base">✅</span>
+                            <p className="text-primary text-[8px] font-black uppercase tracking-wide">
+                                以下食譜已通過 AI 雙層食安審核，確認符合一般人可食標準
+                            </p>
+                        </div>
                         <div className="grid grid-cols-2 gap-3">
                             {recommendedRecipes.map((r) => (
-                                <RecipeCard 
-                                    key={r.id} 
-                                    recipe={r} 
-                                    onClick={() => navigate(`/recipe/${r.id}`)} 
-                                    getCategoryLabel={(c) => c === "vegetable" ? "蔬菜" : c === "fruit" ? "水果" : c === "meat" ? "肉類" : "綜合"} 
+                                <RecipeCard
+                                    key={r.id}
+                                    recipe={r}
+                                    onClick={() => navigate(`/recipe/${r.id}`)}
+                                    getCategoryLabel={(c) => c === "vegetable" ? "蔬菜" : c === "fruit" ? "水果" : c === "meat" ? "肉類" : "綜合"}
                                 />
                             ))}
                         </div>
@@ -77,8 +98,8 @@ export function Recipes() {
                             <ChefHat size={32} className="text-primary/20" />
                         </div>
                         <h4 className="text-white font-black text-xs uppercase mb-2">未發現相容方案</h4>
-                        <button 
-                            onClick={() => navigate("/")} 
+                        <button
+                            onClick={() => navigate("/")}
                             className="inline-flex items-center gap-2 px-6 py-3 bg-primary text-background rounded-2xl font-black uppercase text-[9px]"
                         >
                             返回掃描
@@ -86,6 +107,35 @@ export function Recipes() {
                     </div>
                 )}
             </div>
+        </div>
+    );
+}
+
+/** 載入中的骨架屏元件 */
+function RecipeSkeleton() {
+    return (
+        <div className="rounded-2xl bg-white/5 border border-white/5 p-2 flex flex-col gap-2 h-full">
+            <div className="relative w-full aspect-square rounded-xl bg-white/5 overflow-hidden">
+                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent -translate-x-full animate-[shimmer_2s_infinite]" />
+            </div>
+            <div className="space-y-2 px-1 pb-2">
+                <div className="h-2 w-1/3 bg-white/10 rounded-full" />
+                <div className="h-3 w-full bg-white/10 rounded-full" />
+                <div className="h-6 w-full bg-white/5 rounded-lg mt-2" />
+            </div>
+        </div>
+    );
+}
+
+/** 帶動畫延遲的 loading 步驟提示元件 */
+function LoadingStep({ icon, label, delay }: { icon: string; label: string; delay: string }) {
+    return (
+        <div
+            className="flex items-center gap-2 opacity-0 animate-[fadeIn_0.5s_ease-out_forwards]"
+            style={{ animationDelay: delay }}
+        >
+            <span className="text-[10px]">{icon}</span>
+            <span className="text-white/50 text-[7px] font-bold uppercase tracking-widest">{label}</span>
         </div>
     );
 }

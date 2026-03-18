@@ -141,6 +141,12 @@ export function MainLayout() {
     const activeColor = settings.themeColor || "#00ff88";
     const atmosphere = STATIC_PALETTES[activeColor] || generateAtmosphere(activeColor);
 
+    useEffect(() => {
+        // 每次路徑改變，重置滾動位置到頂部，提升導航體驗
+        const main = document.querySelector('main');
+        if (main) main.scrollTop = 0;
+    }, [location.pathname]);
+
     return (
         <div className={`min-h-screen flex justify-center w-full overflow-hidden ${!settings.darkMode ? 'light-theme' : ''}`} style={{ backgroundColor: atmosphere.bg }}>
             <div 
@@ -166,10 +172,10 @@ export function MainLayout() {
                             dragConstraints={{ left: 0, right: 0 }}
                             onDragEnd={handleDragEnd}
                             dragListener={!settings.isModalOpen}
-                            initial={{ opacity: 0, x: 30 }}
+                            initial={{ opacity: 0, x: 20 }}
                             animate={{ opacity: 1, x: 0 }}
-                            exit={{ opacity: 0, x: -30, position: "absolute", top: 0, left: 0, width: "100%" }}
-                            transition={{ duration: 0.25, ease: "easeOut" }}
+                            exit={{ opacity: 0, x: -20, position: "absolute", top: 0, left: 0, width: "100%" }}
+                            transition={{ duration: 0.2, ease: "easeOut" }}
                             className="min-h-full w-full"
                         >
                             <Outlet />

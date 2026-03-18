@@ -4,11 +4,16 @@
  * 這個模組負責與 Google Gemini API 進行通訊，
  * 根據用戶提供的食材清單動態生成食譜建議。
  * 支援多模型輪詢與多金鑰自動切換。
+ * v2: 食譜圖片改用 100 張圖庫智能匹配。
  */
+
+import { matchRecipeImage } from "../data/recipeImageLibrary";
 
 export interface LLMRecipeRequest {
     ingredients: string[]; // 用戶擁有的食材
-    preferences?: string; // 用戶偏好 (可選)
+    preferences?: string;  // 用戶偏好 (可選)
+    /** 樂觀式 UI 回調：規則篩選完成後立即呼叫此函式，不必等候 AI 審核 */
+    onOptimisticResult?: (recipes: LLMRecipe[]) => void;
 }
 
 export interface LLMRecipe {
@@ -188,7 +193,10 @@ class LLMService {
             const cached = localStorage.getItem(cacheKey);
             if (cached) {
                 console.log("[LLM] 命中快取，正在載入預存食譜...");
-                return JSON.parse(cached);
+                const parsed = JSON.parse(cached);
+                // 快取結果也立即觸發 Optimistic，讓 UI 瞬間響應
+                request.onOptimisticResult?.(parsed);
+                return parsed;
             }
         } catch (e) {
             console.warn("[LLM] 快取讀取失敗:", e);
@@ -206,32 +214,220 @@ class LLMService {
             const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
             if (!text) throw new Error("Empty AI response");
 
-            const recipes = JSON.parse(text).map((r: any) => ({
-                id: `ai-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
-                name: r.name || "AI 家常料理",
-                image: this.getPlaceholderImage(r.category),
-                time: r.time || "20 min",
-                difficulty: r.difficulty || "easy",
-                category: r.category || "mixed",
-                requiredIngredients: this.normalizeArray(r.requiredIngredients || request.ingredients),
-                description: r.description || "符合現有食材的實用食譜建議。",
-                matchScore: r.matchScore || 90,
-                steps: this.normalizeSteps(r.steps),
-                sustainabilityTip: r.sustainabilityTip || "",
-                substitutionTip: r.substitutionTip || ""
-            }));
+            const rawRecipes = JSON.parse(text).map((r: any) => {
+                const category = r.category || "mixed";
+                const rawName = r.name || "";
+                const requiredIngredients = this.normalizeArray(r.requiredIngredients || request.ingredients);
+                const name = this.sanitizeRecipeName(rawName, requiredIngredients, category);
+                const imageUrl = matchRecipeImage(name, requiredIngredients, category);
+                
+                // ✨ 圖片預加載：一拿到 URL 就讓瀏覽器開始偷跑下載
+                if (imageUrl) {
+                    const img = new Image();
+                    img.src = imageUrl;
+                }
 
-            // 2. 寫入快取
-            try {
-                localStorage.setItem(cacheKey, JSON.stringify(recipes));
-            } catch (e) {
-                console.warn("[LLM] 快取寫入失敗:", e);
-            }
+                return {
+                    id: `ai-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+                    name,
+                    image: imageUrl,
+                    time: r.time || "20 min",
+                    difficulty: r.difficulty || "easy",
+                    category,
+                    requiredIngredients,
+                    description: r.description || "符合現有食材的實用食譜建議。",
+                    matchScore: r.matchScore || 90,
+                    steps: this.normalizeSteps(r.steps),
+                    sustainabilityTip: r.sustainabilityTip || "",
+                    substitutionTip: r.substitutionTip || ""
+                };
+            });
 
-            return recipes;
+            // 2. 規則層篩選（超快速）
+            const ruleFiltered = this.applyLocalRules(rawRecipes);
+            console.log(`[篩選] 規則層完成: ${rawRecipes.length} → ${ruleFiltered.length} 筆`);
+
+            // 3. ✨ 樂觀式 UI：規則過濾完就先顯示給用戶看，不等後面的 AI 審核
+            const optimisticResult = ruleFiltered.length > 0 ? ruleFiltered : rawRecipes;
+            request.onOptimisticResult?.(optimisticResult);
+
+            // 4. 背景檢查：AI 食安審核移到背景執行，不阻塞 UI
+            this.aiValidateRecipes(ruleFiltered).then(validated => {
+                const finalRecipes = validated.length > 0 ? validated : ruleFiltered;
+                console.log(`[背景審核] 完成: ${ruleFiltered.length} → ${finalRecipes.length} 筆，更新快取`);
+                // 靜默更新快取，即便用戶這回沒看到，下次載入也會是通過審核的
+                try {
+                    localStorage.setItem(cacheKey, JSON.stringify(finalRecipes));
+                } catch (_) {}
+            }).catch(err => {
+                console.warn("[背景審核] 失敗:", err);
+            });
+
+            // 回傳即時結果
+            return optimisticResult;
         } catch (e) {
             console.error("[LLM] 生成食譜最終失敗:", e);
             return this.getLocalFallback(request.ingredients);
+        }
+    }
+
+    // ════════════════════════════════════════════════════
+    //  Layer 1：本地規則篩選（毫秒級，不耗 API 配額）
+    // ════════════════════════════════════════════════════
+
+    /**
+     * 危險食材組合黑名單（化學性衝突或食物中毒風險）
+     * 格式：[食材A, 食材B] → 兩者同時出現時拒絕
+     */
+    private readonly DANGEROUS_COMBOS: [string, string][] = [
+        ["菠菜", "豆腐"],            // 草酸鈣結石風險（過量才有問題，但常被誤傳—保守提示）
+        ["螃蟹", "柿子"],            // 傳統禁忌：單寧酸 + 蛋白質
+        ["螃蟹", "石榴"],
+        ["海鮮", "啤酒"],            // 痛風風險
+        ["羊肉", "西瓜"],            // 傳統中醫禁忌（寒熱衝突）
+        ["牛奶", "醋"],              // 使牛奶凝固
+        ["蜂蜜", "蔥"],              // 傳統禁忌
+        ["鴨蛋", "李子"],
+        ["未熟豆", "生食"],          // 豆類生食中毒
+    ];
+
+    /** 不可食用/不合理的關鍵字（食譜名稱/描述含此詞則過濾） */
+    private readonly INEDIBLE_KEYWORDS = [
+        "肥皂", "洗潔精", "清潔劑", "藥品", "漂白", "酒精消毒",
+        "未煮熟", "生鮮直食", "毒", "有毒", "致癌",
+        "貓糧", "狗糧", "飼料", "生豆",
+    ];
+
+    /** 最少需要的烹飪步驟數（防止空殼食譜） */
+    private readonly MIN_STEPS = 2;
+    /** 食譜名稱最短長度 */
+    private readonly MIN_NAME_LENGTH = 4;
+
+    private applyLocalRules(recipes: LLMRecipe[]): LLMRecipe[] {
+        return recipes.filter(recipe => {
+            const nameAndDesc = `${recipe.name} ${recipe.description}`.toLowerCase();
+            const ingrs = recipe.requiredIngredients.map(i => i.toLowerCase());
+
+            // ❌ 1. 含不可食關鍵字
+            if (this.INEDIBLE_KEYWORDS.some(kw => nameAndDesc.includes(kw))) {
+                console.warn(`[規則] 拒絕「${recipe.name}」：含不可食詞彙`);
+                return false;
+            }
+
+            // ❌ 2. 食譜名稱太短（可能是亂生成）
+            if (recipe.name.replace(/\s/g, "").length < this.MIN_NAME_LENGTH) {
+                console.warn(`[規則] 拒絕「${recipe.name}」：名稱過短`);
+                return false;
+            }
+
+            // ❌ 3. 步驟數不足（空殼食譜）
+            if (!recipe.steps || recipe.steps.length < this.MIN_STEPS) {
+                console.warn(`[規則] 拒絕「${recipe.name}」：步驟不足`);
+                return false;
+            }
+
+            // ❌ 4. 危險食材組合
+            for (const [a, b] of this.DANGEROUS_COMBOS) {
+                const hasA = ingrs.some(i => i.includes(a));
+                const hasB = ingrs.some(i => i.includes(b));
+                if (hasA && hasB) {
+                    console.warn(`[規則] 拒絕「${recipe.name}」：危險組合 ${a}+${b}`);
+                    return false;
+                }
+            }
+
+            // ❌ 5. matchScore 過低（AI 自己認為匹配度差）
+            if (recipe.matchScore < 30) {
+                console.warn(`[規則] 拒絕「${recipe.name}」：matchScore ${recipe.matchScore} < 30`);
+                return false;
+            }
+
+            return true;
+        });
+    }
+
+    // ════════════════════════════════════════════════════
+    //  Layer 2：AI 食安審核（呼叫 Gemini 做最終把關）
+    // ════════════════════════════════════════════════════
+
+    /**
+     * 讓 AI 審核員逐一判斷每道食譜是否符合「一般人可安全食用」的標準。
+     * 回傳通過審核的食譜列表。
+     */
+    private async aiValidateRecipes(recipes: LLMRecipe[]): Promise<LLMRecipe[]> {
+        if (recipes.length === 0) return [];
+
+        const reviewTarget = recipes.map((r, idx) => ({
+            index: idx,
+            name: r.name,
+            ingredients: r.requiredIngredients,
+            steps: r.steps?.map(s => s.description).join("；") || "",
+            description: r.description
+        }));
+
+        const prompt = `你是一位嚴格的食品安全審核員與料理專家。
+請逐一審核以下 ${recipes.length} 道食譜，判斷每道是否符合「一般健康成人可以安全食用的正常料理」標準。
+
+審核食譜列表（JSON）：
+${JSON.stringify(reviewTarget, null, 2)}
+
+**審核標準（全部通過才算合格）：**
+1. ✅ 食材組合符合常識 - 這些食材合理搭配、確實能一起烹煮
+2. ✅ 烹調方式正確 - 步驟描述合理，食物有完整烹熟
+3. ✅ 不含毒性風險 - 無已知食物中毒或過敏原衝突
+4. ✅ 是真實存在的料理 - 不是捏造的荒謬菜名
+5. ✅ 份量與步驟合乎邏輯 - 有完整的備菜與烹飪流程
+
+**不合格情形範例（請拒絕）：**
+- 生食直接上桌（未描述加熱）
+- 食材清單為空或只有調味料
+- 明顯有害的搭配（如過量鹽、酸鹼衝突等）
+- 食譜描述含糊到根本無法執行的程度
+- 根本不是屬於人類食用的料理
+
+請僅回傳 JSON Array，包含通過審核的食譜索引號：
+格式：{"passed": [0, 1, 2], "rejected": [{"index": 數字, "reason": "理由"}]}`;
+
+        try {
+            const data = await this.scheduledRequest(() => ({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: {
+                    temperature: 0.1,  // 低溫度讓審核更嚴謹
+                    responseMimeType: "application/json"
+                }
+            }));
+
+            const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) {
+                console.warn("[AI審核] 無回應，跳過審核");
+                return recipes;
+            }
+
+            const result = JSON.parse(text);
+            const passedIndices: number[] = result.passed || [];
+
+            // 記錄拒絕原因
+            if (result.rejected?.length > 0) {
+                result.rejected.forEach((r: { index: number; reason: string }) => {
+                    const recipeName = recipes[r.index]?.name || `#${r.index}`;
+                    console.warn(`[AI審核] ❌ 拒絕「${recipeName}」- 原因：${r.reason}`);
+                });
+            }
+
+            const passedRecipes = passedIndices
+                .filter(i => i >= 0 && i < recipes.length)
+                .map(i => ({
+                    ...recipes[i],
+                    // ✅ 加上審核通過標記（可在 UI 顯示）
+                    description: recipes[i].description
+                }));
+
+            console.log(`[AI審核] ✅ 通過 ${passedRecipes.length}/${recipes.length} 道食譜`);
+            return passedRecipes;
+
+        } catch (e) {
+            console.warn("[AI審核] 審核失敗，保留所有食譜:", e);
+            return recipes; // 審核失敗時不影響主流程
         }
     }
 
@@ -253,16 +449,120 @@ class LLMService {
             }
         }
 
-        return `你是一位擅長傳統家常菜的資深主廚。
+        return `你是一位擁有 30 年經驗、精通台灣家常料理的御廚主廚。
 請根據用戶擁有的食材：${request.ingredients.join(", ")}，生成 3 個 JSON 格式的食譜建議。${dietaryInfo}
 
 規則：
-1. **風格**：必須是「家常菜」(Home-style)，避免法式精緻料理或過於複雜的創意料理。
-2. **食材限制**：盡可能只使用提供的食材。除了常見的基礎調味料（油、鹽、醬油、胡椒、糖、蒜、蔥）外，不可隨意添加其他需要額外購買的主菜或配料。
-3. **續航與替代**：如果必須使用到某些常用但用戶沒提到的食材（例如雞蛋、洋蔥），請在 \`substitutionTip\` 中說明替代方案。
-4. **零浪費智慧 (Zero-Waste)**：你必須針對這道食譜提供一個 \`sustainabilityTip\`，告訴用戶如何減少食材浪費（例如：剩餘菜梗可以熬湯、果皮可以除臭、如何延長食材保存等）。
-5. **輸出格式**：必須維持 JSON Array 格式。
+1. **食譜命名（最重要！）**：食譜名稱必須使用繁體中文，要口語化、誘人、有食欲感。
+   - ✅ 好的名稱範例：「黃金蒜香奶油炒蝦」「嫩滑番茄炒蛋蓋飯」「古早味蔥爆豬肉」「家傳秘制紅燒排骨」「香氣逼人蒜苗炒肉絲」
+   - ❌ 嚴格禁止的名稱：含英文字母（如 AI、Stir Fry）、含引號「」或括號()、過於籠統（如「炒菜」「雞肉料理」「食譜一」）
+   - ❌ 禁止出現「AI」「食譜」「料理一/二/三」等技術詞彙
+   - 命名格式必須是：[形容詞/技法] + [主要食材] + [烹調方式]，例如「嫩煎胡椒鹽豬排」「古早味三杯雞腿」
+   - 名稱長度必須在 6~16 個中文字之間
+2. **風格**：必須是「台式家常菜」，讓人想到媽媽的味道，避免法式精緻料理或歐美料理風格。
+3. **食材限制**：盡可能只使用提供的食材。除了常見的基礎調味料（油、鹽、醬油、胡椒、糖、蒜、蔥、薑）外，不可隨意添加其他需要額外購買的主菜或配料。
+4. **續航與替代**：如果必須使用到某些常用但用戶沒提到的食材（例如雞蛋、洋蔥），請在 \`substitutionTip\` 中說明替代方案。
+5. **零浪費智慧 (Zero-Waste)**：你必須針對這道食譜提供一個 \`sustainabilityTip\`，告訴用戶如何減少食材浪費（例如：剩餘菜梗可以熬湯、果皮可以除臭、如何延長食材保存等）。
+6. **輸出格式**：必須維持 JSON Array 格式，name 必須是符合上述規範的繁體中文誘人名稱。
 格式：[{name, time, difficulty, category, requiredIngredients, description, sustainabilityTip, substitutionTip, steps:[{title, description}], matchScore}]`;
+    }
+
+    // ════════════════════════════════════════════════════
+    //  食譜名稱修正器（sanitizeRecipeName）
+    //  處理 AI 偶爾生成的怪名：英文混雜、引號殘留、過短等
+    // ════════════════════════════════════════════════════
+
+    /** 各類別對應的台式烹調動詞備用庫 */
+    private readonly COOKING_VERBS: Record<string, string[]> = {
+        meat:      ["嫩煎", "古早味", "香滷", "蔥爆", "紅燒", "家傳", "三杯", "蒜香"],
+        vegetable: ["清炒", "嫩炒", "蒜香", "家常", "涼拌", "爆炒", "燙拌"],
+        mixed:     ["家常", "古早味", "蔥香", "金黃", "醬燒", "鮮美", "暖心"],
+        soup:      ["暖胃", "鮮甜", "濃郁", "清甜", "滋補", "古早味"],
+        rice:      ["黃金", "蛋香", "蒜味", "台式", "家常", "古早味"],
+        noodle:    ["嫩滑", "醬香", "家常", "古早味", "鮮美", "清爽"],
+        seafood:   ["鮮甜", "蒜香", "薑蔥", "酥炸", "清蒸", "鹽烤"],
+        egg:       ["嫩滑", "黃金", "家常", "古早味", "蔥花"],
+        fruit:     ["清爽", "鮮甜", "繽紛", "夏日"],
+        dessert:   ["香甜", "綿密", "濃郁", "清涼"],
+    };
+
+    /** 各類別的烹調後綴備用庫 */
+    private readonly COOKING_SUFFIX: Record<string, string[]> = {
+        meat:      ["炒肉片", "燉肉", "排骨", "家常菜", "下飯菜"],
+        vegetable: ["炒青菜", "蔬菜", "時蔬", "家常菜"],
+        mixed:     ["家常菜", "下飯菜", "快炒"],
+        soup:      ["湯", "濃湯", "暖湯", "家常湯"],
+        rice:      ["炒飯", "蓋飯", "拌飯"],
+        noodle:    ["炒麵", "湯麵", "拌麵"],
+        seafood:   ["海鮮", "炒蝦", "蒸魚"],
+        egg:       ["炒蛋", "蛋料理", "烘蛋"],
+        fruit:     ["水果", "沙拉", "拼盤"],
+        dessert:   ["甜點", "布丁", "蛋糕"],
+    };
+
+    /**
+     * 修正 AI 生成的食譜名稱
+     * - 移除引號、括號、英文字母、多餘空白
+     * - 若名稱仍不合格，根據食材+類別自動重組一個合理中文名
+     */
+    private sanitizeRecipeName(rawName: string, ingredients: string[], category: string): string {
+        if (!rawName) return this.buildFallbackName(ingredients, category);
+
+        // Step 1: 移除常見污染字元
+        let name = rawName
+            .replace(/[「」『』"'【】\[\]()（）《》<>]/g, "")  // 移除各種括號引號
+            .replace(/[a-zA-Z]+/g, "")                        // 移除英文字母（AI、Stir Fry 等）
+            .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")     // 移除控制字元
+            .replace(/\s+/g, "")                              // 移除所有空白
+            .trim();
+
+        // Step 2: 移除技術/無意義詞彙頭尾
+        const BANNED_PREFIXES = ["食譜", "料理", "菜單", "推薦", "第", "\d+\.", "一", "二", "三"];
+        const BANNED_PATTERNS = [
+            /^(食譜|料理|菜單|推薦)[一二三1-9\d]*/,
+            /^[第]?[一二三四五1-9][道個]/,
+            /^(\d+[\.、])/,
+        ];
+        for (const pattern of BANNED_PATTERNS) {
+            name = name.replace(pattern, "").trim();
+        }
+
+        // Step 3: 長度檢查（< 4 字 or > 20 字算不合格）
+        const cleanLength = [...name].length; // 正確計算中文字數
+        const isTooShort = cleanLength < 4;
+        const isTooLong  = cleanLength > 20;
+        const hasOnlyChinese = /^[\u4e00-\u9fa5\u3000-\u303f\uff00-\uffef0-9]+$/.test(name);
+
+        if (isTooShort || isTooLong || !hasOnlyChinese || name === "") {
+            console.warn(`[命名修正] 名稱「${rawName}」不合格(清洗後:「${name}」)，重新生成`);
+            return this.buildFallbackName(ingredients, category);
+        }
+
+        console.log(`[命名修正] "${rawName}" → "${name}"`);
+        return name;
+    }
+
+    /**
+     * 根據食材與類別重新組合一個台式家常菜名稱
+     * 格式：[動詞前綴] + [主食材] + [後綴]
+     */
+    private buildFallbackName(ingredients: string[], category: string): string {
+        const verbs   = this.COOKING_VERBS[category]   || this.COOKING_VERBS.mixed;
+        const suffixes = this.COOKING_SUFFIX[category] || this.COOKING_SUFFIX.mixed;
+
+        const verb   = verbs[Math.floor(Math.random() * verbs.length)];
+        const suffix = suffixes[Math.floor(Math.random() * suffixes.length)];
+
+        // 取最多兩個主食材（去除純空白和過短的）
+        const mainIngrs = ingredients
+            .filter(i => i.trim().length >= 1)
+            .slice(0, 2)
+            .map(i => i.replace(/[a-zA-Z\s]/g, "").slice(0, 3))  // 只取中文部分，最多3字
+            .filter(i => i.length > 0);
+
+        const ingrPart = mainIngrs.length > 0 ? mainIngrs.join("") : "家常";
+
+        return `${verb}${ingrPart}${suffix}`;
     }
 
     private cleanJson(text: string): string {
@@ -306,34 +606,34 @@ class LLMService {
         }
     }
 
+    /** @deprecated 已由 matchRecipeImage 取代，保留供向後相容 */
     private getPlaceholderImage(category: string): string {
-        const images: Record<string, string> = {
-            vegetable: "https://images.unsplash.com/photo-1512621776951-a57141f2eefd?q=80&w=800",
-            meat: "https://images.unsplash.com/photo-1544025162-d76694265947?q=80&w=800",
-            mixed: "https://images.unsplash.com/photo-1547592166-23ac45744acd?q=80&w=800",
-            fruit: "https://images.unsplash.com/photo-1519996529931-28324d5a630e?q=80&w=800"
-        };
-        return images[category] || images.mixed;
+        return matchRecipeImage("", [], category);
     }
 
     private getLocalFallback(ingredients: string[]): LLMRecipe[] {
+        const main = ingredients[0] || "食材";
         const templates = [
-            { name: `${ingredients[0] || "綜合"}風味炒飯`, category: "mixed" as const },
-            { name: `家常 ${ingredients[0] || "精選"} 濃湯`, category: "vegetable" as const },
-            { name: `活力 ${ingredients[0] || "低碳"} 沙拉`, category: "mixed" as const }
+            { name: `古早味 ${main} 蒜香炒飯`, category: "rice" as any, cat: "mixed" as const },
+            { name: `暖心 ${main} 家常濃湯`, category: "soup" as any, cat: "vegetable" as const },
+            { name: `清爽 ${main} 涼拌沙拉`, category: "salad" as any, cat: "mixed" as const }
         ];
 
         return templates.map((t, idx) => ({
             id: `local-${idx}-${Date.now()}`,
             name: t.name,
-            image: this.getPlaceholderImage(t.category),
+            image: matchRecipeImage(t.name, ingredients, t.cat),
             time: "15 min",
-            difficulty: "easy",
-            category: t.category,
+            difficulty: "easy" as const,
+            category: t.cat,
             requiredIngredients: ingredients,
-            description: "本地端智慧匹配生成的食譜方案。",
+            description: `以 ${main} 為主角的台式家常料理，快速美味上桌。`,
             matchScore: 90,
-            steps: [{ title: "準備", description: "清洗並準備所有食材。" }, { title: "烹飪", description: "依照個人喜好進行烹調。" }]
+            steps: [
+                { title: "食材準備", description: `將 ${main} 洗淨切好，蒜頭拍碎備用。` },
+                { title: "下鍋烹調", description: "熱鍋下油，依序放入食材拌炒至熟透入味。" },
+                { title: "調味起鍋", description: "加入適量鹽巴、醬油調味，起鍋前撒上蔥花提香。" }
+            ]
         }));
     }
 

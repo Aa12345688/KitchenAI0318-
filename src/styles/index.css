@@ -37,3 +37,52 @@ html {
 .no-scrollbar::-webkit-scrollbar {
     display: none !important;
 }
+
+/* ── 行動端效能補強 ── */
+
+/* 1. 為動畫元素啟用 GPU 指令 */
+.performance-layer {
+    will-change: transform, opacity;
+    transform: translateZ(0); /* 強制觸發硬體加速 */
+    backface-visibility: hidden;
+}
+
+/* 2. 視窗內渲染優化：針對長列表 */
+.optimize-list {
+    content-visibility: auto;
+    contain-intrinsic-size: 0 500px; /* 預估高度，防止滾動條跳動 */
+}
+
+/* 3. 重要：針對行動端（不支援 hover 的設備）自動減弱濾鏡 */
+@media (hover: none) {
+    .backdrop-blur-xl, 
+    .backdrop-blur-2xl,
+    .backdrop-blur-3xl {
+        backdrop-filter: blur(8px) !important; /* 強制降級，減少 GPU 負擔 */
+        -webkit-backdrop-filter: blur(8px) !important;
+    }
+    
+    /* 移除部分不必要的陰影以提升滾動流暢度 */
+    .shadow-2xl, .shadow-3xl {
+        box-shadow: 0 4px 12px rgba(0,0,0,0.3) !important;
+    }
+}
+
+/* ── 食安審核步驟 fadeIn 動畫 ── */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateX(-8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+/* 骨架屏流光動畫 */
+@keyframes shimmer {
+    100% {
+        transform: translateX(100%);
+    }
+}

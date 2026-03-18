@@ -9,24 +9,34 @@ interface RecipeCardProps {
 /**
  * 食譜卡片組件 (RecipeCard)
  * 負責渲染在「AI 食譜推薦列表」中的單一食譜預覽圖文框。
- * 
- * 功能亮點：
- * 1. 使用大幅背景圖片配合漸層遮罩，襯托賽博龐克介面。
- * 2. 顯示 AI 運算的「匹配度 (Match Score)」，展現科技感。
- * 3. 點擊後會透過 `onClick` 事件導航至該食譜的詳細步驟頁 `RecipeDetail`。
  */
 export function RecipeCard({ recipe, onClick, getCategoryLabel }: RecipeCardProps) {
+    const handleCardClick = () => {
+        // ✨ 精英級手機震動回饋 (Haptic Feedback)
+        if ('vibrate' in navigator) {
+            navigator.vibrate(10); // 10ms 極短震動，模擬機械手感
+        }
+        onClick();
+    };
+
     return (
         <div
-            onClick={onClick}
-            className="group relative rounded-2xl overflow-hidden bg-[#0d231b]/60 backdrop-blur-xl shadow-[0_15px_30px_-5px_rgba(0,0,0,0.6)] border border-white/5 transition-all duration-500 cursor-pointer hover:translate-y-[-2px] p-2 flex flex-col gap-2"
+            onClick={handleCardClick}
+            className="group relative rounded-2xl overflow-hidden bg-[#0d231b]/60 backdrop-blur-xl shadow-[0_15px_30px_-5px_rgba(0,0,0,0.6)] border border-white/5 transition-all duration-500 cursor-pointer hover:translate-y-[-2px] p-2 flex flex-col gap-2 animate-in fade-in slide-in-from-bottom-2 duration-500 fill-mode-both performance-layer"
         >
             {/* Square Image Container */}
-            <div className="relative w-full aspect-square rounded-xl overflow-hidden shadow-lg">
+            <div className="relative w-full aspect-square rounded-xl overflow-hidden shadow-lg bg-white/5">
                 <img
                     src={recipe.image}
                     alt={recipe.name}
-                    className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700"
+                    loading="lazy"
+                    onLoad={(e) => {
+                        e.currentTarget.style.opacity = "1";
+                        e.currentTarget.classList.add("scale-100");
+                        e.currentTarget.classList.remove("scale-105");
+                    }}
+                    style={{ opacity: 0 }}
+                    className="w-full h-full object-cover group-hover:scale-110 transition-all duration-700 scale-105"
                 />
                 <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-40" />
                 
